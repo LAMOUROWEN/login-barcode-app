@@ -1,0 +1,25 @@
+# Node modules
+**/node_modules/
+
+# Expo build artifacts
+**/.expo/
+**/.expo-shared/
+**/web-build/
+
+# Python cache
+**/__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+
+# OS/IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Secrets
+*.env
+_systemcore/
