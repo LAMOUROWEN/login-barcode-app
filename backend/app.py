@@ -1,146 +1,122 @@
-# app.py
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.security import check_password_hash
 import mysql.connector
-
-from flask_jwt_extended import (
-    JWTManager, create_access_token, jwt_required, get_jwt_identity
-)
+import os, jwt, datetime
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}}, allow_headers=["Content-Type", "Authorization"])
 
-# --- CORS (dev-open; tighten origins later if needed) ---
-CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASS = os.getenv("DB_PASS", "temp_pass")
+DB_NAME = os.getenv("DB_NAME", "experience_assets")
 
-# --- JWT setup (use an env var in real life) ---
-app.config["JWT_SECRET_KEY"] = "change-me-in-prod"
-jwt = JWTManager(app)
-
-# --- DB connector ---
 def get_db():
-    # Simple connector; can switch to pooling if needed
-    return mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="temp_pass",
-        database="experience_assets",
-    )
+    return mysql.connector.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME)
 
-# ---------- HEALTH ----------
-@app.route("/api/health")
-def health():
+def db_dict(q, p=()):
+    db = get_db(); cur = db.cursor(dictionary=True); cur.execute(q, p)
+    rows = cur.fetchall(); cur.close(); db.close(); return rows
+
+def db_exec(q, p=()):
+    db = get_db(); cur = db.cursor(); cur.execute(q, p); db.commit(); cur.close(); db.close()
+
+def get_auth_user():
+    hdr = request.headers.get("Authorization", "")
+    print("DEBUG Authorization header:", hdr[:40], "..." if hdr else "(missing)")
+    if not hdr or not hdr.startswith("Bearer "):
+        return None, ("Missing or bad Authorization header", 401)
+
+    token = hdr.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        # optional: confirm sub type to debug
+        print("DEBUG decoded payload sub:", repr(payload.get("sub")), "type:", type(payload.get("sub")).__name__)
+        return payload, None
+    except jwt.ExpiredSignatureError:
+        print("Auth debug: expired token")
+        return None, ("Token expired", 401)
+    except jwt.InvalidTokenError as e:
+        print("Auth debug decode error:", repr(e))
+        return None, ("Invalid token", 401)
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json(force=True)
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+    db = get_db(); cur = db.cursor(dictionary=True)
+    cur.execute("SELECT id, username, password_hash, company_id FROM users WHERE username=%s LIMIT 1", (username,))
+    row = cur.fetchone(); cur.close(); db.close()
+    if not row or not check_password_hash(row["password_hash"], password):
+        return jsonify({"error": "Invalid credentials"}), 401
+    exp = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    token = jwt.encode(
+    {"sub": str(row["id"]), "username": row["username"], "exp": exp},
+    JWT_SECRET,
+    algorithm="HS256",
+)
+
+    return jsonify({"token": token, "user": {"id": row["id"], "username": row["username"], "company_id": row["company_id"]}})
+
+@app.route("/api/me", methods=["GET"])
+def me():
+    payload, err = get_auth_user()
+    if err: msg, code = err; return jsonify({"error": msg}), code
+    return jsonify({"ok": True, "user": {"id": payload["sub"], "username": payload["username"]}})
+
+# --- Inventory ---
+@app.route("/api/inventory", methods=["GET"])
+def inventory_list():
+    payload, err = get_auth_user()
+    if err: msg, code = err; return jsonify({"error": msg}), code
+    company_id = request.args.get("company_id", type=int)
+    if not company_id: return jsonify({"error": "company_id required"}), 400
+    q = (request.args.get("q") or "").strip()
+    limit = min(request.args.get("limit", 50, type=int), 200)
+    offset = request.args.get("offset", 0, type=int)
+    if q:
+        rows = db_dict("""SELECT id, item_name AS name, barcode, value AS price, quantity AS qty
+                          FROM inventory WHERE company_id=%s AND (item_name LIKE %s OR barcode LIKE %s)
+                          ORDER BY id DESC LIMIT %s OFFSET %s""",
+                       (company_id, f"%{q}%", f"%{q}%", limit, offset))
+    else:
+        rows = db_dict("""SELECT id, item_name AS name, barcode, value AS price, quantity AS qty
+                          FROM inventory WHERE company_id=%s
+                          ORDER BY id DESC LIMIT %s OFFSET %s""",
+                       (company_id, limit, offset))
+    return jsonify({"items": rows})
+
+@app.route("/api/inventory/<barcode>", methods=["GET"])
+def inventory_get(barcode):
+    payload, err = get_auth_user()
+    if err: msg, code = err; return jsonify({"error": msg}), code
+    company_id = request.args.get("company_id", type=int)
+    if not company_id: return jsonify({"error": "company_id required"}), 400
+    rows = db_dict("""SELECT id, item_name AS name, barcode, value AS price, quantity AS qty
+                      FROM inventory WHERE company_id=%s AND barcode=%s LIMIT 1""",
+                   (company_id, barcode))
+    if not rows: return jsonify({"found": False}), 404
+    return jsonify({"found": True, "item": rows[0]})
+
+@app.route("/api/inventory", methods=["POST"])
+def inventory_upsert():
+    payload, err = get_auth_user()
+    if err: msg, code = err; return jsonify({"error": msg}), code
+    d = request.get_json(force=True)
+    for r in ["company_id", "barcode", "name"]:
+        if not d.get(r): return jsonify({"error": f"{r} required"}), 400
+    company_id = int(d["company_id"]); barcode = str(d["barcode"]).strip()
+    name = d["name"].strip(); price = float(d.get("price", 0) or 0); qty = int(d.get("qty", 0) or 0)
+    db_exec("""INSERT INTO inventory (company_id, barcode, item_name, value, quantity)
+               VALUES (%s,%s,%s,%s,%s)
+               ON DUPLICATE KEY UPDATE item_name=VALUES(item_name), value=VALUES(value), quantity=VALUES(quantity)""",
+            (company_id, barcode, name, price, qty))
     return jsonify({"ok": True})
 
-# ---------- REGISTER ----------
-@app.route("/api/register", methods=["POST"])
-def register():
-    data = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip()
-    password = (data.get("password") or "").strip()
-    email    = (data.get("email") or "").strip() or None
-
-    if not username or not password:
-        return jsonify({"error": "username and password required"}), 400
-
-    db = get_db()
-    cur = db.cursor(dictionary=True)
-    try:
-        cur.execute("SELECT id FROM users WHERE username=%s", (username,))
-        if cur.fetchone():
-            return jsonify({"error": "username already exists"}), 409
-
-        pw_hash = generate_password_hash(password)
-        cur.execute(
-            "INSERT INTO users (username, password_hash, email) VALUES (%s,%s,%s)",
-            (username, pw_hash, email),
-        )
-        db.commit()
-
-        cur.execute("SELECT id, username, email FROM users WHERE username=%s", (username,))
-        return jsonify({"message": "registered", "user": cur.fetchone()}), 201
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        cur.close()
-        db.close()
-
-# ---------- LOGIN ----------
-@app.post("/api/login")
-def login():
-    try:
-        data = request.get_json() or {}
-        username = (data.get("username") or "").strip()
-        password = data.get("password") or ""
-
-        db = get_db(); cur = db.cursor(dictionary=True)
-        cur.execute("""
-            SELECT id, username, password_hash, company_id
-            FROM users
-            WHERE username=%s
-        """, (username,))
-        user = cur.fetchone()
-        cur.close(); db.close()
-
-        if not user or not check_password_hash(user["password_hash"], password):
-            return jsonify({"error": "Invalid credentials"}), 401
-
-        token = create_access_token(identity={
-            "id": user["id"],
-            "username": user["username"],
-            "company_id": user["company_id"],
-        })
-
-        return jsonify({
-            "token": token,
-            "user": {
-                "id": user["id"],
-                "username": user["username"],
-                "company_id": user["company_id"],
-            }
-        })
-    except Exception as e:
-        # Surface exact error during dev
-        return jsonify({"error": f"login failed: {str(e)}"}), 500
-
-# ---------- INVENTORY ----------
-@app.get("/api/inventory")
-@jwt_required()
-def get_inventory():
-    ident = get_jwt_identity() or {}
-    # Optional query params
-    company = request.args.get("company") or None
-    company_id = request.args.get("company_id", type=int)
-
-    # Default to the logged-in user's company if none provided
-    if not company and company_id is None:
-        company_id = ident.get("company_id")
-
-    db = get_db(); cur = db.cursor(dictionary=True)
-    try:
-        if company:
-            cur.execute(
-                "SELECT * FROM inventory WHERE company=%s ORDER BY id DESC",
-                (company,)
-            )
-        elif company_id is not None:
-            cur.execute(
-                "SELECT * FROM inventory WHERE company_id=%s ORDER BY id DESC",
-                (company_id,)
-            )
-        else:
-            cur.execute("SELECT * FROM inventory ORDER BY id DESC")
-
-        rows = cur.fetchall()
-        return jsonify(rows)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        cur.close(); db.close()
-
-# ---------- MAIN ----------
 if __name__ == "__main__":
-    print("Routes:")
-    for r in app.url_map.iter_rules():
-        print("  ", r)
     app.run(host="0.0.0.0", port=5000, debug=True)

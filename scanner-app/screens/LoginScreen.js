@@ -1,9 +1,8 @@
 import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Platform } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
 
-const BASE = Platform.OS === 'web'
-  ? 'http://127.0.0.1:5000'          // web in same machine as Flask
-  : 'http://192.168.10.106:5000';    // phones/emulators on LAN
+const BASE = Platform.OS === 'web' ? 'http://127.0.0.1:5000' : 'http://192.168.10.106:5000';
 
 export default function LoginScreen({ navigation }) {
   const [username, setUsername] = useState('');
@@ -11,7 +10,6 @@ export default function LoginScreen({ navigation }) {
   const [err, setErr] = useState('');
 
   const handleLogin = async () => {
-    console.log("Login button pressed");
     setErr('');
     try {
       const res = await fetch(`${BASE}/api/login`, {
@@ -21,26 +19,28 @@ export default function LoginScreen({ navigation }) {
       });
 
       const data = await res.json();
-      console.log('Login response:', data);
+      if (!res.ok) { setErr(data?.error || 'Login failed'); return; }
 
-      if (!res.ok) {
-        console.log('Login failed:', data);
-        setErr(data?.error || 'Login failed');
-        return;
+      const { token: authToken, user } = data;
+
+      // Persist session (native)
+      try {
+        await SecureStore.setItemAsync('token', authToken);
+        await SecureStore.setItemAsync('user', JSON.stringify(user));
+        await SecureStore.setItemAsync('last_username', username);
+      } catch {}
+
+      // Persist session (web)
+      if (Platform.OS === 'web') {
+        try {
+          window.localStorage.setItem('token', authToken);
+          window.localStorage.setItem('user', JSON.stringify(user));
+          window.localStorage.setItem('last_username', username);
+        } catch {}
       }
 
-      const { token, user } = data;
-      console.log('Token:', token);
-      console.log('User:', user);
-
-      navigation.replace('Home', {
-        userId: user.id,
-        token,
-        company_id: user.company_id,
-      });
-      console.log('Navigated to Home');
+      navigation.replace('Home', { userId: user.id, token: authToken, company_id: user.company_id });
     } catch (e) {
-      console.log('Network error:', e);
       setErr('Network error');
     }
   };
@@ -48,29 +48,12 @@ export default function LoginScreen({ navigation }) {
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Sign in</Text>
-
-      <TextInput
-        style={styles.input}
-        placeholder="Username"
-        placeholderTextColor="#aaa"
-        value={username}
-        onChangeText={setUsername}
-        autoCapitalize="none"
-      />
-      <TextInput
-        style={styles.input}
-        placeholder="Password"
-        placeholderTextColor="#aaa"
-        value={password}
-        onChangeText={setPassword}
-        secureTextEntry
-      />
-
+      <TextInput style={styles.input} placeholder="Username" placeholderTextColor="#aaa"
+        value={username} onChangeText={setUsername} autoCapitalize="none" />
+      <TextInput style={styles.input} placeholder="Password" placeholderTextColor="#aaa"
+        value={password} onChangeText={setPassword} secureTextEntry />
       {!!err && <Text style={styles.error}>{err}</Text>}
-
-      <TouchableOpacity style={styles.button} onPress={handleLogin}>
-        <Text style={styles.buttonText}>Log in</Text>
-      </TouchableOpacity>
+      <TouchableOpacity style={styles.button} onPress={handleLogin}><Text style={styles.buttonText}>Log in</Text></TouchableOpacity>
     </View>
   );
 }

@@ -1,15 +1,16 @@
-import React, { useEffect, useLayoutEffect, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useCallback } from 'react';
 import { View, Text, TextInput, StyleSheet, FlatList, TouchableOpacity, Platform } from 'react-native';
 import { Picker } from '@react-native-picker/picker';
+import * as SecureStore from 'expo-secure-store';
 
 const BASE = Platform.OS === 'web'
   ? 'http://127.0.0.1:5000'          // web in same machine
   : 'http://192.168.10.106:5000';    // phones/emulators on LAN
 
 export default function HomeScreen({ route, navigation }) {
-  const userId = route?.params?.userId || null;
-  const token = route?.params?.token || '';
-  const defaultCompanyId = route?.params?.company_id || null;
+  const navToken = route?.params?.token ?? '';
+  const company_id = route?.params?.company_id ?? null;
+  const userId = route?.params?.userId ?? null;
 
   const [items, setItems] = useState([]);
   const [company, setCompany] = useState('');
@@ -27,62 +28,70 @@ export default function HomeScreen({ route, navigation }) {
     });
   }, [navigation]);
 
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        setLoading(true);
-        setErr('');
+  const load = useCallback(async () => {
+    if (!company_id) {
+      setErr('Missing company_id');
+      return;
+    }
+    setLoading(true);
+    setErr('');
 
-        let query = '';
-        if (company) {
-          query = `?company=${encodeURIComponent(company)}`;
-        } else if (defaultCompanyId) {
-          query = `?company_id=${defaultCompanyId}`;
-        }
+    try {
+      // 1) Get token
+      let token = navToken || '';
+if (!token) {
+  try { token = await SecureStore.getItemAsync('token'); } catch {}
+  if (!token && Platform.OS === 'web') {
+    try { token = localStorage.getItem('token') || ''; } catch {}
+  }
+}
+console.log('DEBUG token before fetch:', token ? token.slice(0, 24) + '...' : '(empty)');
+if (!token) {
+  setErr('No auth token. Please log in again.');
+  navigation.replace('Login');
+  return;
+}
 
-        const url = `${BASE}/api/inventory${query}`;
-        const res = await fetch(url, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
 
-        if (res.status === 401) {
-          setErr('Session expired. Please log in again.');
-          navigation.replace('Login');
-          return;
-        }
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // 2) Build URL
+      const url = `${BASE}/api/inventory?company_id=${company_id}&q=${encodeURIComponent(searchTerm)}&limit=100`;
 
-        const data = await res.json();
-        if (alive) setItems(Array.isArray(data) ? data : []);
-      } catch (e) {
-        if (alive) {
-          setErr('Failed to load items');
-          setItems([]);
-          console.error('Inventory fetch error:', e);
-        }
-      } finally {
-        if (alive) setLoading(false);
+      // 3) Fetch inventory
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      const data = await res.json();
+
+      if (res.status === 401) {
+        setErr(data?.error || 'Session expired. Please log in again.');
+        navigation.replace('Login');
+        return;
       }
-    })();
-    return () => { alive = false; };
-  }, [company, defaultCompanyId, token]);
+      if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+
+      // 4) Assign inventory items
+      setItems(Array.isArray(data.items) ? data.items : []);
+    } catch (e) {
+      setErr(e.message || 'Failed to load items');
+      setItems([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [company_id, searchTerm, navToken, navigation]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const filtered = items.filter(item =>
-    (item?.item_name || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
+    (item?.name || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
     (item?.barcode || '').includes(searchTerm)
   );
 
   const renderItem = ({ item }) => (
     <View style={styles.card}>
-      <Text style={styles.itemName}>{item.item_name}</Text>
+      <Text style={styles.itemName}>{item.name}</Text>
       <Text>Barcode: {item.barcode}</Text>
-      <Text>Type: {item.asset_type}</Text>
-      <Text>Condition: {item.item_condition}</Text>
-      <Text>Status: {item.status}</Text>
-      {item.company && <Text>Company: {item.company}</Text>}
-      {item.location && <Text>Location: {item.location}</Text>}
-      {item.value != null && <Text>Value: ${item.value}</Text>}
+      <Text>Price: ${item.price}</Text>
+      <Text>Quantity: {item.qty}</Text>
     </View>
   );
 
@@ -103,6 +112,7 @@ export default function HomeScreen({ route, navigation }) {
         placeholderTextColor="#ccc"
         value={searchTerm}
         onChangeText={setSearchTerm}
+        onSubmitEditing={load}
       />
 
       {err ? <Text style={styles.error}>{err}</Text> : null}
