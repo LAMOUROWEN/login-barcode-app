@@ -157,6 +157,7 @@ def inventory_upsert():
     price = float(d.get("price", 0) or 0)
     qty = int(d.get("qty", 0) or 0)
 
+    # NOTE: relies on a UNIQUE KEY(company_id, barcode) on inventory table
     db_exec(
         """INSERT INTO inventory (company_id, barcode, item_name, value, quantity)
            VALUES (%s,%s,%s,%s,%s)
@@ -166,6 +167,59 @@ def inventory_upsert():
         (company_id, barcode, name, price, qty)
     )
     return jsonify({"ok": True})
+
+# NEW: fast quantity adjustment for scanner (+/- 1 or any delta)
+@app.route("/api/inventory/adjust", methods=["POST"])
+def inventory_adjust():
+    """
+    Body: { company_id:int, barcode:str, delta:int }
+    Adjusts quantity of an existing inventory item by delta (e.g. +1, -1).
+    - Keeps qty non-negative via GREATEST(COALESCE(quantity,0)+delta, 0)
+    - Returns 404 if the item doesn't exist (your client can auto-create then retry)
+    """
+    payload, err = get_auth_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    d = request.get_json(force=True)
+    company_id = d.get("company_id")
+    barcode = str(d.get("barcode") or "").strip()
+    try:
+        delta = int(d.get("delta") or 0)
+    except Exception:
+        return jsonify({"error": "delta must be integer"}), 400
+
+    if not company_id or not barcode:
+        return jsonify({"error": "company_id and barcode required"}), 400
+
+    db = get_db()
+    cur = db.cursor(dictionary=True)
+
+    # Update quantity (non-negative clamp)
+    cur.execute(
+        """UPDATE inventory
+              SET quantity = GREATEST(COALESCE(quantity,0) + %s, 0)
+            WHERE company_id=%s AND barcode=%s""",
+        (delta, company_id, barcode),
+    )
+    db.commit()
+
+    if cur.rowcount == 0:
+        # no such item
+        cur.close(); db.close()
+        return jsonify({"error": "item_not_found"}), 404
+
+    # Return the updated row with friendly aliases
+    cur.execute(
+        """SELECT id, item_name AS name, barcode, value AS price, quantity AS qty
+             FROM inventory WHERE company_id=%s AND barcode=%s LIMIT 1""",
+        (company_id, barcode),
+    )
+    row = cur.fetchone()
+    cur.close(); db.close()
+
+    return jsonify({"ok": True, "item": row})
 
 # --- Scan --------------------------------------------------------------------
 @app.route("/api/scan", methods=["POST"])
@@ -244,4 +298,5 @@ def scan_barcode():
 
 # --- Main --------------------------------------------------------------------
 if __name__ == "__main__":
+    # Ensure the app is reachable from devices on your LAN when testing on phones/tablets
     app.run(host="0.0.0.0", port=5000, debug=True)
