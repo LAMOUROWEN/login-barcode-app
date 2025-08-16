@@ -172,29 +172,59 @@ def inventory_upsert():
 @app.route("/api/inventory/adjust", methods=["POST"])
 def inventory_adjust():
     """
-    Body: { company_id:int, barcode:str, delta:int }
-    Adjusts quantity of an existing inventory item by delta (e.g. +1, -1).
-    - Keeps qty non-negative via GREATEST(COALESCE(quantity,0)+delta, 0)
-    - Returns 404 if the item doesn't exist (your client can auto-create then retry)
+    Body: { company_id: int, barcode: str, delta: int }
+    Behavior:
+      - If row exists, quantity += delta
+      - Else insert placeholder row and set quantity accordingly
     """
     payload, err = get_auth_user()
-    if err:
-        msg, code = err
-        return jsonify({"error": msg}), code
+    if err: msg, code = err; return jsonify({"error": msg}), code
 
-    d = request.get_json(force=True)
-    company_id = d.get("company_id")
-    barcode = str(d.get("barcode") or "").strip()
+    d = request.get_json(force=True) or {}
     try:
-        delta = int(d.get("delta") or 0)
+        company_id = int(d.get("company_id"))
+        barcode    = str(d.get("barcode") or "").strip()
+        delta      = int(d.get("delta", 0))
     except Exception:
-        return jsonify({"error": "delta must be integer"}), 400
+        return jsonify({"error": "bad_request"}), 400
 
-    if not company_id or not barcode:
-        return jsonify({"error": "company_id and barcode required"}), 400
+    if not company_id or not barcode or delta == 0:
+        return jsonify({"error":"company_id, barcode, and non-zero delta required"}), 400
 
-    db = get_db()
-    cur = db.cursor(dictionary=True)
+    cnx = get_db()
+    try:
+        cur = cnx.cursor(dictionary=True)
+
+        # Try update existing
+        cur.execute(
+            "UPDATE inventory SET quantity = quantity + %s WHERE company_id=%s AND barcode=%s",
+            (delta, company_id, barcode)
+        )
+        if cur.rowcount == 0:
+            # No row -> insert placeholder
+            starting_qty = max(delta, 0)
+            cur.execute(
+                """INSERT INTO inventory (company_id, barcode, item_name, value, quantity)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)""",
+                (company_id, barcode, f"Scanned {barcode}", 0.0, starting_qty)
+            )
+        cnx.commit()
+
+        # Return resulting row
+        cur.execute(
+            """SELECT id, item_name AS name, barcode, value AS price, quantity AS qty
+               FROM inventory WHERE company_id=%s AND barcode=%s LIMIT 1""",
+            (company_id, barcode)
+        )
+        row = cur.fetchone() or {}
+        return jsonify({"ok": True, "item": row})
+    except Exception as e:
+        cnx.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close(); cnx.close()
+
 
     # Update quantity (non-negative clamp)
     cur.execute(

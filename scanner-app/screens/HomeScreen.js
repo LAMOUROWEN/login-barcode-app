@@ -1,70 +1,45 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef } from 'react';
 import { View, Text, TextInput, StyleSheet, FlatList, TouchableOpacity, Platform } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
-import { useFocusEffect } from '@react-navigation/native';
 
-const BASE =
-  Platform.OS === 'web'
-    ? 'http://127.0.0.1:5000'
-    : 'http://192.168.10.106:5000';
-
-const normalizeBarcode = (s) => String(s || '').replace(/\s/g, '');
+const BASE = Platform.OS === 'web'
+  ? 'http://127.0.0.1:5000'          // if testing in browser on same machine
+  : 'http://192.168.10.106:5000';    // replace with your PC LAN IP if scanning from phone
 
 export default function HomeScreen({ route, navigation }) {
   const navToken   = route?.params?.token ?? '';
   const userId     = route?.params?.userId ?? null;
+  const [companyId, setCompanyId] = useState(null);
 
-  // ✅ Match your DB: SpiritTech=1, Experience=2
-  const companies = [
-    { id: 3, label: 'Experience' },
-    { id: 1, label: 'Spirit Technologies' },
-  ];
+  const [items, setItems]       = useState([]);
+  const [loading, setLoading]   = useState(false);
+  const [err, setErr]           = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
 
-  // Start with NO company selected
-  const [selectedCompanyId, setSelectedCompanyId] = useState(null);
-
-  const [items, setItems]     = useState([]);
-  const [searchTerm, setQ]    = useState('');
-  const [loading, setLoading] = useState(false);
-  const [err, setErr]         = useState('');
-
+  // --- scanner states
   const [scanEnabled, setScanEnabled] = useState(false);
-  const [wedge, setWedge]             = useState('');
   const [scanCount, setScanCount]     = useState(0);
-  const [lastLabel, setLastLabel]     = useState('—');
+  const [lastLabel, setLastLabel]     = useState('');
   const [scanStatus, setScanStatus]   = useState('');
-  const hiddenRef = useRef(null);
+  const [wedge, setWedge]             = useState('');
+  const hiddenRef     = useRef(null);
+  const idleTimerRef  = useRef(null);
+
+  // debug
+  const [debugLastRaw, setDebugLastRaw] = useState('');
+  const [debugFocused, setDebugFocused] = useState(false);
 
   useLayoutEffect(() => {
     navigation?.setOptions?.({
       headerRight: () => (
-        <View style={{ flexDirection:'row', gap:16 }}>
-          <TouchableOpacity
-            onPress={() => setScanEnabled(v => !v)}
-            disabled={!selectedCompanyId}
-          >
-            <Text style={{ color: selectedCompanyId ? 'white' : '#777' }}>
-              {scanEnabled ? 'Stop' : 'Start'}
-            </Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={() => navigation.replace('Login')}>
-            <Text style={{ color: 'white' }}>Logout</Text>
-          </TouchableOpacity>
-        </View>
+        <TouchableOpacity onPress={() => navigation.replace('Login')}>
+          <Text style={{ color: 'white' }}>Logout</Text>
+        </TouchableOpacity>
       ),
     });
-  }, [navigation, scanEnabled, selectedCompanyId]);
+  }, [navigation]);
 
-  useEffect(() => {
-    if (scanEnabled && hiddenRef.current) {
-      setTimeout(() => hiddenRef.current?.focus?.(), 50);
-      setScanStatus('Ready');
-    } else {
-      setScanStatus('');
-      setWedge('');
-    }
-  }, [scanEnabled]);
-
+  // --- helpers
   const getToken = useCallback(async () => {
     let token = navToken || '';
     if (!token) {
@@ -76,56 +51,59 @@ export default function HomeScreen({ route, navigation }) {
     return token;
   }, [navToken]);
 
+  // replace your normalizeBarcode with this:
+const normalizeBarcode = (s) => {
+  const digits = String(s || "").replace(/\D/g, ""); // keep only digits
+
+  // UPC-A 12 digits, but some scanners drop the leading 0 (11)
+  if (digits.length === 11) return "0" + digits;
+
+  // EAN-13 often has a leading 0 for the same product; drop it to compare to UPC-A
+  if (digits.length === 13 && digits.startsWith("0")) return digits.slice(1);
+
+  return digits; // 12 or other
+};
+
+
   const load = useCallback(async () => {
-    if (!selectedCompanyId) return;
-    setLoading(true);
-    setErr('');
+    if (!companyId) return;
+    setLoading(true); setErr('');
     try {
       const token = await getToken();
-      if (!token) {
-        setErr('No auth token. Please log in again.');
-        navigation.replace('Login');
-        return;
-      }
-      const url = `${BASE}/api/inventory?company_id=${selectedCompanyId}&q=${encodeURIComponent(searchTerm)}&limit=100`;
+      if (!token) { setErr('No auth token.'); return; }
+
+      const url = `${BASE}/api/inventory?company_id=${companyId}&q=${encodeURIComponent(searchTerm)}&limit=100`;
       const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
       const data = await res.json();
-      if (res.status === 401) {
-        setErr(data?.error || 'Session expired. Please log in again.');
-        navigation.replace('Login');
-        return;
-      }
       if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
       setItems(Array.isArray(data.items) ? data.items : []);
     } catch (e) {
-      setErr(e.message || 'Failed to load items');
-      setItems([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [selectedCompanyId, searchTerm, getToken, navigation]);
+      setErr(e.message || 'Failed to load items'); setItems([]);
+    } finally { setLoading(false); }
+  }, [companyId, searchTerm, getToken]);
 
   useEffect(() => { load(); }, [load]);
-  useFocusEffect(useCallback(() => { load(); }, [load]));
 
-  const adjustPlusOne = useCallback(async (barcode) => {
+  const adjustPlusOne = useCallback(async (code) => {
     const token = await getToken();
-    if (!token) throw new Error('Missing auth token');
-    const body = { company_id: selectedCompanyId, barcode, delta: 1 };
+    const body = { company_id: companyId, barcode: code, delta: 1 };
     const res = await fetch(`${BASE}/api/inventory/adjust`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify(body),
     });
-    const json = await res.json();
-    if (!res.ok || !json?.ok) throw new Error(json?.error || 'Adjust failed');
-    return json.item;
-  }, [selectedCompanyId, getToken]);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || 'Adjust failed');
+    return data.item;
+  }, [companyId, getToken]);
 
   const onSubmitScan = useCallback(async () => {
-    const code = normalizeBarcode(wedge);
+    const raw  = wedge;
+    const code = normalizeBarcode(raw);
     setWedge('');
+    setDebugLastRaw('');
     if (!code) { setScanStatus('Invalid/empty scan'); return; }
+
     setScanStatus('Sending…');
     try {
       const item = await adjustPlusOne(code);
@@ -138,157 +116,147 @@ export default function HomeScreen({ route, navigation }) {
       setLastLabel(code);
     } finally {
       if (scanEnabled && hiddenRef.current) setTimeout(() => hiddenRef.current?.focus?.(), 20);
+      if (idleTimerRef.current) { clearTimeout(idleTimerRef.current); idleTimerRef.current = null; }
     }
   }, [wedge, scanEnabled, adjustPlusOne, load]);
 
   const renderItem = ({ item }) => (
     <View style={styles.card}>
       <Text style={styles.itemName}>{item.name}</Text>
-      <Text style={styles.dim}>Barcode: {item.barcode}</Text>
-      <Text style={styles.dim}>Price: ${item.price ?? ''}</Text>
-      <Text style={styles.dim}>Quantity: {item.qty}</Text>
-    </View>
-  );
-
-  const CompanyTiles = () => (
-    <View style={styles.tilesWrap}>
-      {companies.map(c => {
-        const active = c.id === selectedCompanyId;
-        return (
-          <TouchableOpacity
-            key={c.id}
-            onPress={() => {
-              setSelectedCompanyId(c.id);
-              setScanEnabled(false);
-              setScanCount(0);
-              setLastLabel('—');
-              setTimeout(load, 0);
-            }}
-            style={[styles.tile, active && styles.tileActive]}
-          >
-            <Text style={[styles.tileTitle, active && styles.tileTitleActive]}>{c.label}</Text>
-            <Text style={styles.tileSub}>inventory</Text>
-          </TouchableOpacity>
-        );
-      })}
+      <Text>Barcode: {item.barcode}</Text>
+      <Text>Price: ${item.price}</Text>
+      <Text>Quantity: {item.qty}</Text>
     </View>
   );
 
   return (
     <View style={styles.container}>
-      {scanEnabled && (
-        <TextInput
-          ref={hiddenRef}
-          value={wedge}
-          onChangeText={setWedge}
-          autoFocus
-          blurOnSubmit={false}
-          onSubmitEditing={onSubmitScan}
-          style={styles.hiddenInput}
-        />
-      )}
-
       {userId ? <Text style={styles.userId}>User ID: {userId}</Text> : null}
       <Text style={styles.title}>Inventory</Text>
 
-      <CompanyTiles />
+      {/* Company toggle buttons */}
+      <View style={styles.companyRow}>
+        <TouchableOpacity
+          style={[styles.companyButton, companyId === 1 && styles.activeCompany]}
+          onPress={() => setCompanyId(1)}
+        >
+          <Text style={styles.companyText}>SpiritTech</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.companyButton, companyId === 3 && styles.activeCompany]}
+          onPress={() => setCompanyId(3)}
+        >
+          <Text style={styles.companyText}>Experience</Text>
+        </TouchableOpacity>
+      </View>
 
-      {!!selectedCompanyId && (
+      {/* Start/Stop scan buttons */}
+      {companyId && (
+        <View style={{ flexDirection: 'row', marginVertical: 10 }}>
+          <TouchableOpacity
+            style={[styles.scanButton, scanEnabled && styles.scanButtonActive]}
+            onPress={() => {
+              setScanEnabled(true);
+              setScanCount(0);
+              setLastLabel('');
+              setScanStatus('');
+              setTimeout(() => hiddenRef.current?.focus?.(), 100);
+            }}
+          >
+            <Text style={styles.scanButtonText}>Start</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.scanButton, !scanEnabled && styles.scanButtonActive]}
+            onPress={() => setScanEnabled(false)}
+          >
+            <Text style={styles.scanButtonText}>Stop</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Debug input visible while scanEnabled */}
+      {scanEnabled && (
         <>
-          <View style={styles.scanBar}>
-            <Text style={styles.scanText}>
-              Trigger Scan: {scanEnabled ? 'ON' : 'OFF'} • Company ID {selectedCompanyId}
-            </Text>
-            <TouchableOpacity
-              style={[styles.scanToggle, scanEnabled ? styles.scanOn : styles.scanOff]}
-              onPress={() => setScanEnabled(v => !v)}
-            >
-              <Text style={styles.btnText}>{scanEnabled ? 'Stop' : 'Start'}</Text>
-            </TouchableOpacity>
-          </View>
-
-          {scanEnabled && (
-            <View style={styles.scanStatusWrap}>
-              <Text style={styles.scanStatus}>
-                Count: <Text style={styles.white}>{scanCount}</Text> • Last: <Text style={styles.white}>{lastLabel}</Text>
-              </Text>
-              <Text style={[styles.scanMsg, scanStatus.startsWith('Error') ? styles.err : styles.ok]}>
-                {scanStatus || 'Ready'}
-              </Text>
-            </View>
-          )}
-
           <TextInput
-            style={styles.search}
-            placeholder="Search by name or barcode"
-            placeholderTextColor="#ccc"
-            value={searchTerm}
-            onChangeText={setQ}
-            onSubmitEditing={load}
+            ref={hiddenRef}
+            value={wedge}
+            onChangeText={(txt) => {
+              setWedge(txt);
+              setDebugLastRaw(txt);
+              if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+              idleTimerRef.current = setTimeout(() => {
+                const code = normalizeBarcode(txt);
+                if (code) onSubmitScan();
+              }, 120);
+            }}
+            autoFocus
+            blurOnSubmit={false}
+            onSubmitEditing={onSubmitScan}
+            onFocus={() => setDebugFocused(true)}
+            onBlur={() => setDebugFocused(false)}
+            style={{
+              backgroundColor: debugFocused ? '#335' : '#333',
+              color: 'white',
+              padding: 10,
+              borderRadius: 8,
+              marginBottom: 8,
+            }}
+            placeholder="Scanner input (visible for debug)"
+            placeholderTextColor="#bbb"
           />
-
-          {err ? <Text style={styles.error}>{err}</Text> : null}
-          {loading ? <Text style={styles.loading}>Loading…</Text> : null}
-
-          <FlatList
-            data={items}
-            renderItem={renderItem}
-            keyExtractor={(item, i) => item?.id?.toString() || String(i)}
-            contentContainerStyle={{ paddingBottom: 20 }}
-          />
+          <Text style={{ color:'#aaa', marginBottom: 6 }}>
+            Focus: {debugFocused ? 'Yes' : 'No'} • Last raw: {debugLastRaw || '—'}
+          </Text>
+          <Text style={{ color:'white' }}>
+            Count: {scanCount} | Last: {lastLabel} | Status: {scanStatus}
+          </Text>
         </>
+      )}
+
+      {err ? <Text style={styles.error}>{err}</Text> : null}
+      {loading ? <Text style={styles.loading}>Loading…</Text> : null}
+
+      {companyId && (
+        <FlatList
+          data={items}
+          renderItem={renderItem}
+          keyExtractor={(item, i) => item?.id?.toString() || String(i)}
+          contentContainerStyle={{ paddingBottom: 20 }}
+        />
       )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { padding: 16, backgroundColor: '#1a1a1a', flex: 1 },
+  container: { padding: 20, backgroundColor: '#1a1a1a', flex: 1 },
   userId: { color: '#888', marginBottom: 6 },
-  title: { fontSize: 22, fontWeight: '700', marginBottom: 12, color: 'white' },
-
-  // tiles
-  tilesWrap: { gap: 12, marginBottom: 14 },
-  tile: {
-    backgroundColor: '#2b4a6a',
-    borderWidth: 2,
-    borderColor: '#2b4a6a',
-    borderRadius: 8,
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-  },
-  tileActive: {
-    backgroundColor: '#2f5680',
-    borderColor: '#4e79a7',
-  },
-  tileTitle: { color: '#dce7f3', fontWeight: '800', fontSize: 18, textDecorationLine: 'underline' },
-  tileTitleActive: { color: '#ffffff' },
-  tileSub: { color: '#a8b5c4', marginTop: 2, fontSize: 14 },
-
-  // scan UI
-  scanBar: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor:'#222', padding:10, borderRadius:10, marginBottom: 12,
-  },
-  scanText: { color:'#cfcfcf', fontWeight:'600' },
-  scanToggle: { paddingVertical:8, paddingHorizontal:14, borderRadius:8 },
-  scanOn: { backgroundColor:'#2a7b2a' },
-  scanOff: { backgroundColor:'#4a90e2' },
-  btnText: { color:'#fff', fontWeight:'700' },
-  scanStatusWrap: { marginBottom: 12 },
-  scanStatus: { color:'#bbb', marginTop: 4 },
-  scanMsg: { marginTop: 4 },
-  ok: { color:'#9fd39f' },
-  err: { color:'#ff7676' },
-  white: { color:'#fff', fontWeight:'800' },
-
-  search: { borderWidth: 1, borderColor: '#999', borderRadius: 6, padding: 10, marginBottom: 12, color: 'white' },
+  title: { fontSize: 24, fontWeight: '600', marginBottom: 10, color: 'white' },
   card: { backgroundColor: '#2c2c2c', padding: 12, marginBottom: 10, borderRadius: 6 },
   itemName: { fontSize: 18, fontWeight: '500', color: 'white' },
-  dim: { color:'#cfcfcf', marginTop: 2 },
-
   error: { color: '#ff7676', marginBottom: 8 },
   loading: { color: '#aaa', marginBottom: 8 },
 
-  hiddenInput: { position: 'absolute', opacity: 0, height: 0, width: 0 },
+  companyRow: { flexDirection: 'row', marginBottom: 10 },
+  companyButton: {
+    flex: 1,
+    padding: 12,
+    marginHorizontal: 4,
+    backgroundColor: '#333',
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  activeCompany: { backgroundColor: '#4a90e2' },
+  companyText: { color: 'white', fontWeight: '600' },
+
+  scanButton: {
+    flex: 1,
+    padding: 12,
+    marginHorizontal: 4,
+    backgroundColor: '#555',
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  scanButtonActive: { backgroundColor: '#4a90e2' },
+  scanButtonText: { color: 'white', fontWeight: '600' },
 });
